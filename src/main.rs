@@ -4,7 +4,10 @@
 //! 替代原 bash + jq/grep/awk 实现。原版每次刷新要 fork 七个进程（Windows 上约
 //! 0.6 秒），而状态栏每 5 秒刷新一次；这里单进程完成，不产生任何子进程。
 
-use std::io::{Read, Write};
+mod inflate;
+
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -266,8 +269,9 @@ fn count_skills(dir: &Path) -> usize {
 /// 从 cwd 逐级向上找 `.git`，读 HEAD。
 ///
 /// 在分支上时 HEAD 是符号引用，取其分支名；detached HEAD 时 HEAD 存的是裸 SHA，
-/// 改为找指向该 commit 的 tag，找不到再退回 7 位短 SHA。worktree 与 submodule 的
-/// `.git` 是文件，内容形如 `gitdir: <路径>`，需顺着指向再读其 HEAD。
+/// 改为找指向该 commit 的 tag（附注 tag 需读对象库解引用），找不到再退回 7 位短
+/// SHA。worktree 与 submodule 的 `.git` 是文件，内容形如 `gitdir: <路径>`，
+/// 需顺着指向再读其 HEAD。
 fn git_branch(start: &Path) -> Option<String> {
     let mut dir = start;
     loop {
@@ -293,9 +297,11 @@ fn git_branch(start: &Path) -> Option<String> {
             return Some(name.to_string());
         }
         if !head.is_empty() && head.bytes().all(|b| b.is_ascii_hexdigit()) {
-            // detached：有 tag 指向该 commit 就显示 tag 名，没有则退回 7 位短 SHA
+            // detached：有 tag 指向该 commit 就显示 tag 名，没有则退回 7 位短 SHA。
+            // 引用与对象都在共享 gitdir（worktree 场景）里找
+            let common = common_git_dir(&git_dir);
             return Some(
-                find_tag(&git_dir, head).unwrap_or_else(|| head.chars().take(7).collect()),
+                find_tag(&common, head).unwrap_or_else(|| head.chars().take(7).collect()),
             );
         }
         return None;
@@ -304,11 +310,10 @@ fn git_branch(start: &Path) -> Option<String> {
 
 /// 在 tag 引用里找指向 `sha` 的那个，同时覆盖松散引用与 packed-refs。
 ///
-/// 已知局限：松散的附注 tag（refs/tags 下未打包、值是 tag object SHA 的文件）
-/// 需要解析对象库才能解引用，这里匹配不到。打包进 packed-refs 的 tag 带 `^` 行
-/// 给出 peeled commit，可以正常匹配，而 clone 来的仓库 tag 基本都是这一种。
+/// 松散附注 tag（值是 tag 对象 SHA）借助对象库解引用；打包进 packed-refs 的附注 tag
+/// 直接读 `^` 解引发行。tag 对象 delta 存储等解引用不出的情况，由调用方退回短 SHA。
 fn find_tag(git_dir: &Path, sha: &str) -> Option<String> {
-    if let Some(name) = find_loose_tag(&git_dir.join("refs/tags"), sha) {
+    if let Some(name) = find_loose_tag(&git_dir.join("refs/tags"), git_dir, sha) {
         return Some(name);
     }
 
@@ -341,21 +346,246 @@ fn find_tag(git_dir: &Path, sha: &str) -> Option<String> {
     None
 }
 
-/// 递归扫描 refs/tags 下的松散引用，返回相对 `refs/tags` 的 tag 名（tag 名可含
-/// `/`，如 `release/v2.0.3`）
-fn find_loose_tag(dir: &Path, sha: &str) -> Option<String> {
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().to_string();
-        if path.is_dir() {
-            if let Some(found) = find_loose_tag(&path, sha) {
-                // 用 `/` 手工拼接而非 Path::join：git ref 名必须以 `/` 分隔，
-                // 而 join 在 Windows 上会给出 `\`
-                return Some(format!("{name}/{found}"));
-            }
-        } else if std::fs::read_to_string(&path).is_ok_and(|c| c.trim() == sha) {
-            return Some(name);
+/// 递归扫描 refs/tags 下的松散引用，返回相对 `refs/tags` 的 tag 名（tag 名可含 `/`，
+/// 如 `release/v2.0.3`）：值直接是 commit SHA（轻量 tag）时直接比较；附注 tag 的候选
+/// 收齐后统一解引用——松散对象逐个查，pack 侧批量检索，避免每个 tag 都把全部包扫一遍
+fn find_loose_tag(dir: &Path, git_dir: &Path, sha: &str) -> Option<String> {
+    let mut annotated: Vec<(String, String)> = Vec::new(); // (tag 名, tag 对象 SHA)
+    if let Some(name) = collect_loose_tags(dir, "", sha, &mut annotated) {
+        return Some(name);
+    }
+
+    let mut candidates: Vec<[u8; 20]> = Vec::new();
+    let mut names: Vec<String> = Vec::new();
+    for (name, object_sha) in &annotated {
+        if read_loose_object(git_dir, object_sha)
+            .and_then(|object| tag_target(&object))
+            .as_deref()
+            == Some(sha)
+        {
+            return Some(name.clone());
+        }
+        if let Some(sha20) = hex_to_sha(object_sha) {
+            candidates.push(sha20);
+            names.push(name.clone());
+        }
+    }
+
+    for (i, object) in read_packed_objects(git_dir, &candidates) {
+        if tag_target(&object).as_deref() == Some(sha) {
+            return Some(names[i].clone());
         }
     }
     None
+}
+
+/// 递归收集松散 tag 引用：值直接命中返回 Some(名)；不能直接判断的记入 pending
+fn collect_loose_tags(
+    dir: &Path,
+    prefix: &str,
+    sha: &str,
+    pending: &mut Vec<(String, String)>,
+) -> Option<String> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        // 用 `/` 手工拼接而非 Path::join：git ref 名必须以 `/` 分隔，
+        // 而 join 在 Windows 上会给出 `\`
+        let full = if prefix.is_empty() {
+            name.clone()
+        } else {
+            format!("{prefix}/{name}")
+        };
+        if path.is_dir() {
+            if let Some(hit) = collect_loose_tags(&path, &full, sha, pending) {
+                return Some(hit);
+            }
+            continue;
+        }
+        // git 更新引用时先写 `<名>.lock` 再改名，忽略避免读到半成品
+        if name.ends_with(".lock") {
+            continue;
+        }
+        let Some(content) = std::fs::read_to_string(&path).ok() else {
+            continue;
+        };
+        let content = content.trim();
+        if content == sha {
+            return Some(full);
+        }
+        if content.len() == 40 && content.bytes().all(|b| b.is_ascii_hexdigit()) {
+            pending.push((full, content.to_string()));
+        }
+    }
+    None
+}
+
+/// worktree 的 gitdir（.git/worktrees/<名>）只放本工作树自己的文件（HEAD、index 等），
+/// refs 与 objects 都共享主仓 .git，commondir 文件指向那里；普通仓库与 submodule 没有它
+fn common_git_dir(git_dir: &Path) -> PathBuf {
+    match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(content) => {
+            let common = PathBuf::from(content.trim());
+            if common.is_absolute() {
+                common
+            } else {
+                git_dir.join(common)
+            }
+        }
+        Err(_) => git_dir.to_path_buf(),
+    }
+}
+
+/// 从对象正文里取 tag 指向的目标对象：松散对象带 `<type> <size>\0` 前缀，pack 条目
+/// 没有，先剥掉再读首行 `object <sha>`；非 tag 对象返回 None
+fn tag_target(object: &[u8]) -> Option<String> {
+    let content = match object.iter().position(|&b| b == 0) {
+        Some(end) if end < 32 => &object[end + 1..],
+        _ => &object[..],
+    };
+    let first = content.split(|b| *b == b'\n').next()?;
+    let target = std::str::from_utf8(first).ok()?.strip_prefix("object ")?;
+    let target = target.trim();
+    // 目标行必须是完整 SHA；commit 对象首行是 `tree <sha>`，自然不匹配
+    (target.len() == 40 && target.bytes().all(|b| b.is_ascii_hexdigit())).then(|| target.to_string())
+}
+
+/// 读松散对象：zlib 解压出对象正文。上限 256 字节足够覆盖 tag 对象首行，
+/// 超出时解压提前收尾，正文开头仍然完整
+fn read_loose_object(git_dir: &Path, sha: &str) -> Option<Vec<u8>> {
+    let path = git_dir.join("objects").join(&sha[..2]).join(&sha[2..]);
+    inflate::zlib_decompress(&std::fs::read(path).ok()?, 256)
+}
+
+/// idx v2 的固定区长度：8 字节 magic + 版本，之后是 256 项 fanout
+const IDX_HEADER: usize = 8 + 256 * 4;
+
+/// 批量读取 pack 内对象：每个 idx 只打开一次，先读表头 + fanout 做首字节预筛，
+/// 有候选落在包内才整读并在 idx 里逐个二分。返回 (候选序号, 对象正文)。
+/// 只支持 idx v2 与完整（非 delta）对象——tag 对象极小，实测各仓库均以完整对象存储；
+/// delta 条目会被跳过，由调用方退回短 SHA
+fn read_packed_objects(git_dir: &Path, shas: &[[u8; 20]]) -> Vec<(usize, Vec<u8>)> {
+    let mut hits = Vec::new();
+    let Ok(entries) = std::fs::read_dir(git_dir.join("objects").join("pack")) else {
+        return hits;
+    };
+    for entry in entries.flatten() {
+        let idx_path = entry.path();
+        if idx_path.extension().and_then(|e| e.to_str()) != Some("idx") {
+            continue;
+        }
+        let mut head = [0u8; IDX_HEADER];
+        let Ok(mut file) = File::open(&idx_path) else {
+            continue;
+        };
+        if file.read_exact(&mut head).is_err()
+            || head[..4] != [0xff, b't', b'O', b'c']
+            || u32::from_be_bytes(head[4..8].try_into().expect("固定 4 字节")) != 2
+        {
+            continue;
+        }
+        let fanout = |byte: usize| -> usize {
+            u32::from_be_bytes(
+                head[8 + byte * 4..12 + byte * 4].try_into().expect("fanout 固定 4 字节"),
+            ) as usize
+        };
+        let has_candidate = shas.iter().any(|sha| {
+            let first = sha[0] as usize;
+            let lo = if first == 0 { 0 } else { fanout(first - 1) };
+            lo != fanout(first)
+        });
+        if !has_candidate {
+            continue;
+        }
+
+        let Ok(idx) = std::fs::read(&idx_path) else {
+            continue;
+        };
+        let count = fanout(255);
+        for (i, sha) in shas.iter().enumerate() {
+            if hits.iter().any(|(hit, _)| *hit == i) {
+                continue;
+            }
+            let first = sha[0] as usize;
+            let lo = if first == 0 { 0 } else { fanout(first - 1) };
+            let hi = fanout(first);
+            if let Some(object) = search_idx(&idx_path, &idx, count, lo, hi, sha) {
+                hits.push((i, object));
+            }
+        }
+    }
+    hits
+}
+
+/// 在整读的 idx 缓冲里二分定位 sha；命中则按偏移读对应 pack 条目
+fn search_idx(
+    idx_path: &Path,
+    idx: &[u8],
+    count: usize,
+    mut lo: usize,
+    mut hi: usize,
+    sha: &[u8; 20],
+) -> Option<Vec<u8>> {
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        match idx.get(IDX_HEADER + mid * 20..IDX_HEADER + mid * 20 + 20)?.cmp(&sha[..]) {
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+            std::cmp::Ordering::Equal => {
+                let offsets = IDX_HEADER + count * 20 + count * 4;
+                let off32 = u32::from_be_bytes(
+                    idx.get(offsets + mid * 4..offsets + mid * 4 + 4)?.try_into().ok()?,
+                );
+                let offset = if off32 & 0x8000_0000 == 0 {
+                    off32 as u64
+                } else {
+                    // 高位为 1 时低 31 位是 64 位偏移表的序号，表紧跟在 32 位偏移表之后
+                    let big = offsets + count * 4 + (off32 & 0x7fff_ffff) as usize * 8;
+                    u64::from_be_bytes(idx.get(big..big + 8)?.try_into().ok()?)
+                };
+                return read_pack_entry(&idx_path.with_extension("pack"), offset);
+            }
+        }
+    }
+    None
+}
+
+/// 读 pack 条目：变长头给出类型与解压后大小，随后是 zlib 流
+fn read_pack_entry(pack_path: &Path, offset: u64) -> Option<Vec<u8>> {
+    let mut file = File::open(pack_path).ok()?;
+    file.seek(SeekFrom::Start(offset)).ok()?;
+
+    let mut byte = [0u8; 1];
+    file.read_exact(&mut byte).ok()?;
+    let obj_type = (byte[0] >> 4) & 7;
+    let mut size = (byte[0] & 0x0f) as u64;
+    let mut shift = 4;
+    while byte[0] & 0x80 != 0 {
+        file.read_exact(&mut byte).ok()?;
+        size |= ((byte[0] & 0x7f) as u64) << shift;
+        shift += 7;
+    }
+    // 4 = 完整 tag 对象；6/7 是 delta 存储，放弃（调用方退回短 SHA）
+    if obj_type != 4 || size > 64 * 1024 {
+        return None;
+    }
+
+    // 读取上限：deflate 真实编码不膨胀，2 倍大小足以覆盖并防御损坏头部的谎报
+    let mut compressed = Vec::new();
+    file.take(size * 2 + 1024).read_to_end(&mut compressed).ok()?;
+    // 解压上限取 size + 1：正常流恰好解出 size 字节，能走完 adler32 校验
+    let out = inflate::zlib_decompress(&compressed, (size + 1) as usize)?;
+    (out.len() as u64 == size).then_some(out)
+}
+
+/// 40 位十六进制 SHA-1 转 20 字节；非法输入返回 None
+fn hex_to_sha(hex: &str) -> Option<[u8; 20]> {
+    if hex.len() != 40 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut sha = [0u8; 20];
+    for (i, byte) in sha.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(sha)
 }

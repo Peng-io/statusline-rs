@@ -41,7 +41,7 @@ Claude Code 每次渲染时经 stdin 传入一个 JSON 对象，程序消费其�
 
 除 stdin 之外，程序还会直接读文件，不启动任何子进程：
 
-- **git 分支 / tag**：从 cwd 逐级向上找 `.git`，读其 `HEAD`。在分支上时 HEAD 是符号引用，取分支名；detached 时找指向该 commit 的 tag，找不到退回 7 位短 SHA。同时覆盖松散引用（`refs/tags/`）与 `packed-refs`（含附注 tag 的 `^` peeled 行）。worktree 与 submodule 的 `.git` 是文件、内容形如 `gitdir: <路径>`，会顺指针再读。
+- **git 分支 / tag**：从 cwd 逐级向上找 `.git`，读其 `HEAD`。在分支上时 HEAD 是符号引用，取分支名；detached 时找指向该 commit 的 tag（附注 tag 读对象库解引用：松散对象、pack 内完整对象、packed-refs 的 `^` 解引发行都覆盖），找不到退回 7 位短 SHA。worktree 与 submodule 的 `.git` 是文件、内容形如 `gitdir: <路径>`，会顺指针再读；worktree 的引用与对象在 `commondir` 指向的共享 gitdir 里找。
 - **扩展配置计数**：全局 `.claude.json`、全局 `settings.json`、项目 `.claude/`、项目根 `.mcp.json`，以及含 `SKILL.md` 的 skills 目录。`CLAUDE_CONFIG_DIR` 会被尊重。
 
 ## 安装
@@ -70,6 +70,7 @@ cp target/release/statusline-rs.exe ~/.claude/statusline.exe
 - **零子进程**：原 bash 版每渲染一次要 fork `cat`、多个 `grep`/`sed`/`awk`、`git` 共七个进程；Rust 版一个进程做完，git 信息全部改为读文件。
 - **性能**：同机同口径实测 200 次平均，bash + jq 版 562ms/次，本版 16ms/次（约 35 倍）。其中约 13ms 是 Git Bash 创建进程的固定开销，程序自身净耗时约 3ms——省下的是那六次额外的进程创建。
 - **行为对齐**：输出与原脚本逐字节比对过，空输入、缺字段等边界情况保持一致。
+- **已知局限**：tag 只做精确匹配，detached 在无 tag 的提交上比 `git describe --tags --always` 少一个「最近 tag + 距离」的回溯；delta 存储的 tag 对象与 idx v1 包不解析，退回 7 位短 SHA（实测多个真实仓库的 tag 对象均以完整对象存储）。
 - **体积**：release 配置启用 `strip` / LTO / `codegen-units=1` / `panic="abort"`，产物 356KB。
 - **跨平台**：无平台特定逻辑，纯 std + serde_json，不启动任何子进程。
 - **唯一依赖**：[serde_json](https://crates.io/crates/serde_json)。
@@ -77,6 +78,7 @@ cp target/release/statusline-rs.exe ~/.claude/statusline.exe
 ## 项目结构
 
 ```text
-src/main.rs   # 全部逻辑
-Cargo.toml    # 含 release 优化配置
+src/main.rs     # 全部逻辑
+src/inflate.rs  # 极简 zlib 解压（读 git 对象用），含单元测试
+Cargo.toml      # 含 release 优化配置
 ```
