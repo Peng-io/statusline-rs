@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# serde 本就是 serde_json 的传递依赖，这里显式声明只为启用 derive；
+# proc-macro 仅参与编译，不进产物，运行时代码量不变
+serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # 状态栏每次刷新都要启动一次进程，压缩体积以缩短加载时间
