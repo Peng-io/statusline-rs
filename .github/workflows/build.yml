@@ -1,0 +1,23 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # --locked 锁住 Cargo.lock 里的版本，免得 CI 拉到新的传递依赖、产物和本地不一致
+      - run: cargo build --release --locked
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: statusline-rs-windows-x86_64
+          path: target/release/statusline-rs.exe
+          if-no-files-found: error
